@@ -1,6 +1,6 @@
 services:
   xunlei-bot:
-    image:ch1swill/xunlei_tg_bot:latest
+    image:ch1swill/xunlei-tg-bot:latest
     container_name: xunlei_tg_bot
     environment:
       # ========== Telegram 配置 ==========
