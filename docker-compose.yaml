@@ -1,0 +1,35 @@
+services:
+  xunlei-bot:
+    image:ch1swill/xunlei_tg_bot:latest
+    container_name: xunlei_tg_bot
+    environment:
+      # ========== Telegram 配置 ==========
+      - BOT_TOKEN=你的TG_BOT_TOKEN
+      - CHAT_ID=你的TG_CHAT_ID
+      
+      # ========== 迅雷配置 ==========
+      # 迅雷 API 地址 (群晖套件格式)
+      - XUNLEI_HOST=http://你的NAS_IP:2345/webman/3rdparty/pan-xunlei-com/index.cgi
+      
+      # 默认下载目录的 file_id (从迅雷网页版获取)
+      - XUNLEI_PARENT_FILE_ID=你的目录ID
+      
+      # 设备空间 ID (URL编码格式)
+      - XUNLEI_SPACE=device_id%23你的设备ID
+      
+      # 认证 Token (JWT格式，有效期较短需要定期更新)
+      - XUNLEI_AUTH=你的pan-auth值
+      
+      # ========== 可选配置 ==========
+      # Cookie (某些环境需要)
+      - XUNLEI_COOKIE=
+      
+      # Syno Token (群晖环境可能需要)
+      - XUNLEI_SYNO_TOKEN=
+      
+      # ========== 代理配置 (可选) ==========
+      - HTTPS_PROXY=http://代理IP:端口
+      - HTTP_PROXY=http://代理IP:端口
+      - NO_PROXY=localhost,127.0.0.1,你的NAS_IP
+      
+    restart: unless-stopped
