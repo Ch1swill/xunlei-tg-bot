@@ -4,6 +4,8 @@ import telebot
 import json
 import urllib.parse
 import time
+import re
+import base64
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- 环境变量 ---
@@ -16,6 +18,9 @@ RAW_SPACE = os.getenv('XUNLEI_SPACE', '')
 XUNLEI_SPACE = urllib.parse.unquote(RAW_SPACE)
 XUNLEI_COOKIE = os.getenv('XUNLEI_COOKIE', '')
 XUNLEI_SYNO_TOKEN = os.getenv('XUNLEI_SYNO_TOKEN', '')
+DB_PATH = os.getenv('XUNLEI_DB_PATH', '')
+# 保留环境变量作为兜底
+ENV_AUTH = os.getenv('XUNLEI_AUTH', '')
 
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.rmvb', '.rm', '.mpg', '.mpeg', '.m2ts', '.iso'}
 MIN_FILE_SIZE = 200 * 1024 * 1024
@@ -24,13 +29,74 @@ bot = telebot.TeleBot(BOT_TOKEN)
 user_pending_tasks = {}
 
 
+def extract_token_from_db():
+    """
+    暴力扫描 BoltDB 数据库文件，提取有效期最长的 JWT Token
+    """
+    if not DB_PATH or not os.path.exists(DB_PATH):
+        return None
+
+    try:
+        # JWT 的特征头: {"alg":"HS256","typ":"JWT"} 的 base64 编码
+        # 对应字节: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
+        pattern = re.compile(b'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9[a-zA-Z0-9\-\._]+')
+        
+        with open(DB_PATH, 'rb') as f:
+            content = f.read()
+            matches = pattern.findall(content)
+            
+        if not matches:
+            return None
+
+        # 找到所有 Token，解码并检查过期时间，取最新的一个
+        best_token = None
+        max_exp = 0
+        
+        for m in matches:
+            token_str = m.decode('utf-8')
+            try:
+                # JWT 结构: header.payload.signature
+                parts = token_str.split('.')
+                if len(parts) != 3: continue
+                
+                # 解码 payload (中间部分)
+                payload_segment = parts[1]
+                # 补全 padding 否则 base64 解码会报错
+                padding = len(payload_segment) % 4
+                if padding:
+                    payload_segment += '=' * (4 - padding)
+                
+                payload = json.loads(base64.urlsafe_b64decode(payload_segment))
+                exp = payload.get('exp', 0)
+                
+                # 取有效期最大的
+                if exp > max_exp:
+                    max_exp = exp
+                    best_token = token_str
+            except Exception:
+                continue
+                
+        if best_token:
+            # 打印一下日志方便调试
+            print(f"🔄 自动获取 Token 成功! 过期时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(max_exp))}")
+            return best_token
+
+    except Exception as e:
+        print(f"⚠️ 读取数据库失败: {e}")
+        
+    return None
+
 def get_headers():
+    # 优先从数据库获取，失败则用环境变量
+    current_token = extract_token_from_db() or ENV_AUTH
+    
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0",
         "Accept": "*/*",
-        "pan-auth": XUNLEI_AUTH,
+        "pan-auth": current_token,
     }
+    # ... (Cookie 和 Syno Token 处理保持不变)
     if XUNLEI_COOKIE:
         headers["Cookie"] = XUNLEI_COOKIE
     if XUNLEI_SYNO_TOKEN:
@@ -321,4 +387,13 @@ def callback_query(call):
 if __name__ == "__main__":
     print("🤖 Bot 启动...")
     print(f"   HOST: {XUNLEI_HOST}")
-    bot.infinity_polling()
+    
+    while True:
+        try:
+            # 增加 timeout 设置，让连接更持久
+            # long_polling_timeout: 告诉 TG 服务器我们要挂多久
+            # timeout: 本地客户端等待多久
+            bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            print(f"❌ 网络连接中断 ({e})，15秒后重试...")
+            time.sleep(15)

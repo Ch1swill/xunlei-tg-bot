@@ -17,19 +17,20 @@ services:
       # 设备空间 ID (URL编码格式)
       - XUNLEI_SPACE=device_id%23你的设备ID
       
-      # 认证 Token (JWT格式，有效期较短需要定期更新)
-      - XUNLEI_AUTH=你的pan-auth值
+      # 【修改】这里不要写死 Token 了，或者留空作为备用
+      - XUNLEI_AUTH=
       
-      # ========== 可选配置 ==========
-      # Cookie (某些环境需要)
-      - XUNLEI_COOKIE=
-      
-      # Syno Token (群晖环境可能需要)
-      - XUNLEI_SYNO_TOKEN=
+      # 【新增】告诉程序数据库在哪里
+      - XUNLEI_DB_PATH=/xunlei_data/user.core.db
       
       # ========== 代理配置 (可选) ==========
       - HTTPS_PROXY=http://代理IP:端口
       - HTTP_PROXY=http://代理IP:端口
       - NO_PROXY=localhost,127.0.0.1,你的NAS_IP
+    volumes:
+      # 【新增关键行】将迅雷的配置目录映射进来 (只读模式 :ro 防止损坏)
+      # ⚠️ 注意：冒号左边的路径必须是你 NAS 上 cnk3x 容器实际的映射路径
+      # 通常是 /mnt/sdb1/configs/xunlei/data 包含 user.core.db 的目录
+      - /mnt/nas_docker/xunlei/.drive:/xunlei_data:ro  
       
     restart: unless-stopped
