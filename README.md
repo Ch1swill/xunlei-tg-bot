@@ -2,13 +2,22 @@
 
 通过 Telegram 向DOCKER版迅雷（cnk3x/xunlei）推送磁力链接下载任务。
 
-## 功能特点
+## 功能特点V1.0
 
 - ✅ 发送磁力链接自动解析
 - ✅ 智能过滤：只下载视频文件（>200MB）
 - ✅ 支持选择下载目录
 - ✅ 支持批量发送（空格或换行分隔）
 - ✅ 自动跳过广告/垃圾文件
+
+## 功能特点V2.0
+### 🔄 全自动 Token 续期
+告别手动复制粘贴 Token！ 支持BOT面板直接操作以及定时健康检查
+- **重要**：需开启 Docker `privileged: true` 及 `host` 网络模式。
+### 📝 任务详情透传
+- **文件名反馈**：Telegram 返回的消息不再只显示任务名，而是直接列出**具体选中的文件名**（如 `MyMovie.2024.mp4`），下载对了没一目了然。
+### ⚡️ 启动即自检
+- 容器启动后**立即**执行一次连通性检查，随后每小时（可配置）自动巡检。
 
 ## 快速开始
 
@@ -25,12 +34,10 @@
 2. 切换到 Network 标签
 3. 在迅雷中操作（如打开文件夹），找到 API 请求
 4. 从请求头中获取：
-   - `XUNLEI_AUTH`: 请求头中的 `pan-auth` 值
-   - `XUNLEI_COOKIE`: 请求头中的 `Cookie` 值（可选）
-   - `XUNLEI_SYNO_TOKEN`: 请求头中的 `x-syno-token` 值（可选）
+   - `XUNLEI_AUTH`: 请求头中的 `pan-auth` 值（可不填，DOCKER启动会自动获取）
 
 5. 从请求 URL/参数中获取：
-   - `XUNLEI_SPACE`: URL 参数中的 `space` 值
+   - `XUNLEI_SPACE`: URL 参数中的 `device_id 值
    - `XUNLEI_PARENT_FILE_ID`: 目标文件夹的 ID
 
 ### 2. 修改配置
@@ -50,36 +57,34 @@ docker-compose logs -f
 docker-compose down
 ```
 
-## 使用方法
+使用指南
+/start: 呼出状态面板，查看当前 Token 状态和迅雷连接情况。
 
-1. 在 Telegram 中找到你的 Bot
-2. 发送磁力链接（支持多个，用空格或换行分隔）
-3. 选择下载目录
-4. 等待下载完成
+直接发送磁力链接:
 
-## 注意事项
+Bot 会自动解析并询问下载目录。
 
-- `XUNLEI_AUTH` (pan-auth) 是 JWT Token，有效期较短，过期后需要重新获取
-- 建议使用代理确保 Telegram Bot 能正常连接
-- 批量下载时每个任务间隔 10 秒，防止触发风控
+点击目录按钮后，Bot 开始添加任务。
 
-## 文件说明
+/check: 手动强制触发一次健康检查。
 
-```
-xunlei-tg-bot/
-├── bot.py              # 主程序
-├── Dockerfile          # Docker 镜像定义
-├── docker-compose.yaml # Docker Compose 配置
-└── README.md           # 本文档
-```
+Token 失效时:
 
-## 常见问题
+Bot 会发消息提示：“⚠️ 警告：Token 已过期... 嗅探器已启动”。
 
-### Token 过期
-如果出现认证错误，需要重新从浏览器获取 `XUNLEI_AUTH` 值并更新配置。
+此时请在电脑或手机浏览器打开迅雷网页版并刷新。
 
-### 连接超时
-检查代理配置，确保容器能访问 Telegram API 和迅雷 API。
+Bot 会提示：“🎯 自动捕获成功”，即可继续使用。
 
-### 下载到错误文件
-已修复：使用 API 返回的 `file_index` 字段而非遍历顺序索引。
+常见问题
+Q: 嗅探器一直提示超时？ A: 请检查以下几点：
+
+docker-compose.yaml 中是否开启了 privileged: true。
+
+network_mode 是否为 host（Bridge 模式下很难抓到宿主机流量）。
+
+SNIFF_PORT 是否填写正确（应为迅雷 Web 页面的端口）。
+
+Q: 为什么 Bot 没反应？ A: 检查日志 docker logs -f xunlei_tg_bot。如果是网络问题（Telegram 连不上），请在环境变量中配置 HTTP_PROXY。
+
+Q: 为什么下载的文件名带反引号？ A: 这是为了防止 Telegram Markdown 解析错误（如文件名含下划线），Bot 在显示时故意包裹的，不影响实际下载的文件名。

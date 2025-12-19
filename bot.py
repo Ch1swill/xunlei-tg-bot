@@ -1,250 +1,264 @@
 import os
 import requests
 import telebot
-import json
 import urllib.parse
 import time
-import re
-import base64
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import threading
+import logging
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
+
+# 导入同目录下的 sniff.py
+import sniff
+
+# --- 日志配置 ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- 环境变量 ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
 XUNLEI_HOST = os.getenv('XUNLEI_HOST', '').rstrip('/')
-XUNLEI_AUTH = os.getenv('XUNLEI_AUTH', '')
-PARENT_FILE_ID = os.getenv('XUNLEI_PARENT_FILE_ID')
+SNIFF_PORT = os.getenv('SNIFF_PORT', '2345')
+SNIFF_INTERFACE = os.getenv('SNIFF_INTERFACE', 'any')
+
 RAW_SPACE = os.getenv('XUNLEI_SPACE', '')
 XUNLEI_SPACE = urllib.parse.unquote(RAW_SPACE)
-XUNLEI_COOKIE = os.getenv('XUNLEI_COOKIE', '')
-XUNLEI_SYNO_TOKEN = os.getenv('XUNLEI_SYNO_TOKEN', '')
-DB_PATH = os.getenv('XUNLEI_DB_PATH', '')
-# 保留环境变量作为兜底
-ENV_AUTH = os.getenv('XUNLEI_AUTH', '')
+XUNLEI_PARENT_FILE_ID = os.getenv('XUNLEI_PARENT_FILE_ID')
+HEALTH_CHECK_INTERVAL = int(os.getenv('HEALTH_CHECK_INTERVAL', 3600))
 
-VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.rmvb', '.rm', '.mpg', '.mpeg', '.m2ts', '.iso'}
-MIN_FILE_SIZE = 200 * 1024 * 1024
+CURRENT_TOKEN = os.getenv('XUNLEI_AUTH', '')
+IS_SNIFFING = False
+TOKEN_LOCK = threading.Lock()
+
+# 常用视频后缀
+VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.rmvb', '.rm', '.mpg', '.mpeg', '.m2ts', '.iso', '.dat', '.vob'}
+MIN_FILE_SIZE = 200 * 1024 * 1024  # 200MB
 
 bot = telebot.TeleBot(BOT_TOKEN)
 user_pending_tasks = {}
 
-
-def extract_token_from_db():
-    """
-    暴力扫描 BoltDB 数据库文件，提取有效期最长的 JWT Token
-    """
-    if not DB_PATH or not os.path.exists(DB_PATH):
-        return None
-
-    try:
-        # JWT 的特征头: {"alg":"HS256","typ":"JWT"} 的 base64 编码
-        # 对应字节: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
-        pattern = re.compile(b'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9[a-zA-Z0-9\-\._]+')
-        
-        with open(DB_PATH, 'rb') as f:
-            content = f.read()
-            matches = pattern.findall(content)
-            
-        if not matches:
-            return None
-
-        # 找到所有 Token，解码并检查过期时间，取最新的一个
-        best_token = None
-        max_exp = 0
-        
-        for m in matches:
-            token_str = m.decode('utf-8')
-            try:
-                # JWT 结构: header.payload.signature
-                parts = token_str.split('.')
-                if len(parts) != 3: continue
-                
-                # 解码 payload (中间部分)
-                payload_segment = parts[1]
-                # 补全 padding 否则 base64 解码会报错
-                padding = len(payload_segment) % 4
-                if padding:
-                    payload_segment += '=' * (4 - padding)
-                
-                payload = json.loads(base64.urlsafe_b64decode(payload_segment))
-                exp = payload.get('exp', 0)
-                
-                # 取有效期最大的
-                if exp > max_exp:
-                    max_exp = exp
-                    best_token = token_str
-            except Exception:
-                continue
-                
-        if best_token:
-            # 打印一下日志方便调试
-            print(f"🔄 自动获取 Token 成功! 过期时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(max_exp))}")
-            return best_token
-
-    except Exception as e:
-        print(f"⚠️ 读取数据库失败: {e}")
-        
-    return None
+# ===========================
+# 1. 基础功能
+# ===========================
 
 def get_headers():
-    # 优先从数据库获取，失败则用环境变量
-    current_token = extract_token_from_db() or ENV_AUTH
-    
-    headers = {
+    with TOKEN_LOCK:
+        token = CURRENT_TOKEN
+    return {
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "*/*",
-        "pan-auth": current_token,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "pan-auth": token,
+        "Cookie": f"xtoken={token}"
     }
-    # ... (Cookie 和 Syno Token 处理保持不变)
-    if XUNLEI_COOKIE:
-        headers["Cookie"] = XUNLEI_COOKIE
-    if XUNLEI_SYNO_TOKEN:
-        headers["x-syno-token"] = XUNLEI_SYNO_TOKEN
-    return headers
 
+def update_token(new_token):
+    global CURRENT_TOKEN
+    with TOKEN_LOCK:
+        CURRENT_TOKEN = new_token
+    logging.info(f"🔄 Token 已更新: {new_token[:10]}...")
+
+def perform_sniffing(chat_id, quiet=False):
+    global IS_SNIFFING
+    if IS_SNIFFING:
+        if not quiet: bot.send_message(chat_id, "⚠️ 嗅探器运行中...")
+        return
+
+    IS_SNIFFING = True
+    if not quiet:
+        bot.send_message(chat_id, "🕵️‍♂️ **嗅探器已启动**", parse_mode="Markdown")
+
+    def run_sniff_thread():
+        global IS_SNIFFING
+        try:
+            token = sniff.capture_token(timeout=60, port=SNIFF_PORT, interface=SNIFF_INTERFACE)
+            if token:
+                update_token(token)
+                bot.send_message(chat_id, "🎯 **Token 更新成功**", parse_mode="Markdown")
+            else:
+                bot.send_message(chat_id, "❌ **嗅探超时**，请检查网络或权限", parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"嗅探出错: {e}")
+        finally:
+            IS_SNIFFING = False
+
+    threading.Thread(target=run_sniff_thread).start()
+
+def check_token_alive(verbose=False):
+    with TOKEN_LOCK:
+        if not CURRENT_TOKEN: return False
+    try:
+        url = f"{XUNLEI_HOST}/drive/v1/tasks"
+        params = {"type": "user#runner", "device_space": ""}
+        res = requests.get(url, params=params, headers=get_headers(), timeout=10)
+        return res.status_code == 200
+    except:
+        return True
+
+def health_check_loop():
+    """
+    健康检查循环
+    逻辑调整：启动时立即检查一次，之后每隔 HEALTH_CHECK_INTERVAL 秒检查一次
+    """
+    logging.info(f"🩺 健康检查服务已启动 (周期: {HEALTH_CHECK_INTERVAL}秒)...")
+    set_bot_commands()
+    
+    while True:
+        try:
+            # 1. 先执行检查
+            logging.info("🩺 执行例行健康检查...")
+            if not check_token_alive(verbose=True):
+                logging.warning("⚠️ 检测到 Token 失效，自动启动嗅探...")
+                perform_sniffing(CHAT_ID, quiet=False)
+            else:
+                logging.info("✅ Token 状态正常")
+                
+        except Exception as e:
+            logging.error(f"检查异常: {e}")
+
+        # 2. 检查完再睡觉
+        time.sleep(HEALTH_CHECK_INTERVAL)
+
+def set_bot_commands():
+    try:
+        bot.set_my_commands([
+            BotCommand("start", "状态面板"),
+            BotCommand("check", "立即检查"),
+        ])
+    except: pass
+
+# ===========================
+# 2. 迅雷逻辑
+# ===========================
 
 def is_video_file(filename):
-    if not filename:
-        return False
-    ext = os.path.splitext(filename.lower())[1]
-    return ext in VIDEO_EXTENSIONS
+    if not filename: return False
+    return os.path.splitext(filename.lower())[1] in VIDEO_EXTENSIONS
 
-
-def collect_all_files(resources, file_list):
-    """
-    递归收集所有文件（非目录）
-    关键：使用 API 返回的 file_index 字段
-    """
+def collect_all_files(resources, file_list, depth=0):
+    prefix = "  " * depth + "├─ "
+    
     for item in resources:
         name = item.get('name', 'Unknown')
-        size = item.get('file_size', 0)
-        is_dir = item.get('is_dir', False)
-        file_index = item.get('file_index')
+        size = int(item.get('file_size', 0))
+        idx = item.get('file_index')
         
-        if is_dir:
+        if idx is None: idx = 0 
+
+        is_directory = item.get('is_dir') or \
+                       item.get('kind') == 'drive#folder' or \
+                       bool(item.get('dir', {}).get('resources'))
+
+        if is_directory:
+            logging.info(f"{prefix}📂 [DIR] {name}")
             sub_resources = item.get('dir', {}).get('resources', [])
             if sub_resources:
-                collect_all_files(sub_resources, file_list)
+                collect_all_files(sub_resources, file_list, depth + 1)
         else:
+            size_mb = size / 1024 / 1024
+            logging.info(f"{prefix}📄 [FILE] {name} ({size_mb:.2f} MB) idx={idx}")
             file_list.append({
                 'name': name,
                 'size': size,
-                'file_index': file_index
+                'file_index': idx
             })
 
-
 def analyze_magnet(magnet):
-    """解析磁力链接，使用 file_index 字段"""
+    logging.info(f"🔍 解析磁力: {magnet[:40]}...")
     url = f"{XUNLEI_HOST}/drive/v1/resource/list"
-    params = {"pan_auth": XUNLEI_AUTH}
+    
+    headers = get_headers()
+    params = {"pan_auth": headers.get('pan-auth')}
     payload = {"page_size": 1000, "urls": magnet}
     
-    print(f"\n{'='*70}")
-    print(f"🔍 [解析中] {magnet[:80]}...")
-    
     try:
-        res = requests.post(url, params=params, json=payload, headers=get_headers())
-        
+        res = requests.post(url, params=params, json=payload, headers=headers, timeout=20)
         if res.status_code != 200:
-            print(f"❌ 请求失败 {res.status_code}: {res.text}")
+            logging.error(f"API请求失败: {res.status_code}")
             return None
         
         data = res.json()
-        
         if 'list' not in data or 'resources' not in data['list']:
-            print(f"❌ 数据结构异常")
             return None
         
         main_resource = data['list']['resources'][0]
         torrent_name = main_resource.get('name', 'Unknown')
-        total_file_count = main_resource.get('file_count', 0)
         
-        print(f"📁 种子名称: {torrent_name}")
-        print(f"📊 文件总数: {total_file_count}")
-        
-        top_resources = main_resource.get('dir', {}).get('resources', [])
-        
-        if not top_resources:
-            file_size = main_resource.get('file_size', 0)
-            print(f"📄 单文件: {torrent_name} ({file_size/1024/1024:.2f} MB)")
-            return {
+        if not main_resource.get('is_dir'):
+             idx = main_resource.get('file_index')
+             if idx is None: idx = 0
+             size = int(main_resource.get('file_size', 0))
+             
+             logging.info(f"✅ 识别为单文件: {torrent_name}")
+             return {
                 "name": torrent_name,
-                "file_size": str(file_size),
-                "total_file_count": str(total_file_count),
-                "sub_file_index": "0"
+                "file_size": str(size),
+                "total_file_count": "1",
+                "sub_file_index": str(idx),
+                "selected_files": [torrent_name]
             }
-        
+
+        top_resources = main_resource.get('dir', {}).get('resources', [])
         all_files = []
-        collect_all_files(top_resources, all_files)
+        if top_resources:
+            collect_all_files(top_resources, all_files)
         
-        print(f"\n📋 文件列表 (共 {len(all_files)} 个文件):")
-        print("-" * 70)
-        
+        if not all_files:
+            logging.warning("❌ 未找到任何文件")
+            return None
+
         selected_indices = []
+        selected_filenames = []
         selected_size = 0
         
+        # 策略A: 视频文件且大于200MB
+        valid_videos = []
         for f in all_files:
-            name = f['name']
-            size = f['size']
-            file_index = f['file_index']
-            size_mb = size / 1024 / 1024
-            
-            is_video = is_video_file(name)
-            size_ok = size > MIN_FILE_SIZE
-            should_select = is_video and size_ok
-            
-            status = "✅" if should_select else "❌"
-            tag = "🎬" if is_video else "📄"
-            idx_str = f"{file_index:3}" if file_index is not None else "N/A"
-            print(f"  {status} {tag} [idx:{idx_str}] {size_mb:>10.2f}MB | {name}")
-            
-            if should_select and file_index is not None:
-                selected_indices.append(str(file_index))
-                selected_size += size
-        
-        print("-" * 70)
-        
-        if not selected_indices:
-            print("⚠️ 没有视频，回退到大小筛选...")
+            if f['file_index'] is not None and f['size'] > MIN_FILE_SIZE and is_video_file(f['name']):
+                valid_videos.append(f)
+
+        if valid_videos:
+            for f in valid_videos:
+                selected_indices.append(str(f['file_index']))
+                selected_filenames.append(f['name'])
+                selected_size += f['size']
+            logging.info(f"✅ 策略A命中: 选中 {len(valid_videos)} 个文件")
+
+        else:
+            # 策略B: 最大文件
+            max_file = None
+            max_size = 0
             for f in all_files:
-                if f['size'] > MIN_FILE_SIZE and f['file_index'] is not None:
-                    selected_indices.append(str(f['file_index']))
-                    selected_size += f['size']
-        
-        if not selected_indices:
-            print("⚠️ 下载全部...")
-            for f in all_files:
-                if f['file_index'] is not None:
-                    selected_indices.append(str(f['file_index']))
-                    selected_size += f['size']
-        
-        print(f"\n✨ 最终选择: {len(selected_indices)} 个文件")
-        print(f"   总大小: {selected_size/1024/1024/1024:.2f} GB")
-        print(f"   file_index 列表: {','.join(selected_indices)}")
-        print(f"{'='*70}\n")
-        
+                if f['size'] > max_size:
+                    max_size = f['size']
+                    max_file = f
+            
+            if max_file and max_size > MIN_FILE_SIZE:
+                idx = max_file['file_index']
+                selected_indices.append(str(idx))
+                selected_filenames.append(max_file['name'])
+                selected_size += max_file['size']
+                logging.info(f"✅ 策略B命中: {max_file['name']}")
+            else:
+                logging.warning(f"❌ 所有文件均太小")
+                return None
+
         return {
             "name": torrent_name,
             "file_size": str(selected_size),
-            "total_file_count": str(total_file_count),
-            "sub_file_index": ",".join(selected_indices)
+            "total_file_count": str(main_resource.get('file_count', 0)),
+            "sub_file_index": ",".join(selected_indices),
+            "selected_files": selected_filenames
         }
         
     except Exception as e:
-        print(f"❌ 异常: {e}")
-        import traceback
-        traceback.print_exc()
+        logging.error(f"解析异常: {e}")
         return None
-
 
 def create_task(magnet, target_id, target_name):
     meta = analyze_magnet(magnet)
-    if not meta:
-        return False
+    if not meta: return False
 
     url = f"{XUNLEI_HOST}/drive/v1/task"
-    
+    headers = get_headers()
     payload = {
         "type": "user#download-url",
         "name": meta['name'],
@@ -259,141 +273,133 @@ def create_task(magnet, target_id, target_name):
             "sub_file_index": meta['sub_file_index']
         }
     }
-    
-    print(f"🚀 创建任务:")
-    print(f"   name: {meta['name']}")
-    print(f"   total_file_count: {meta['total_file_count']}")
-    print(f"   sub_file_index: {meta['sub_file_index']}")
-    
     try:
-        res = requests.post(url, json=payload, headers=get_headers())
-        
-        if res.status_code == 200:
-            result = res.json()
-            if result.get('error'):
-                print(f"❌ API错误: {result}")
-                return False
-            print(f"✅ 成功: {meta['name']}")
-            return meta['name']
-        else:
-            print(f"❌ 失败 {res.status_code}: {res.text}")
-            return False
-    except Exception as e:
-        print(f"❌ 异常: {e}")
-        return False
-
+        res = requests.post(url, json=payload, headers=headers, timeout=20)
+        return meta['selected_files'] if res.status_code == 200 else False
+    except: return False
 
 def get_sub_folders(parent_id):
     folders = []
     try:
         url = f"{XUNLEI_HOST}/drive/v1/files"
-        params = {"parent_id": parent_id, "limit": 100, "pan_auth": XUNLEI_AUTH, "space": XUNLEI_SPACE}
-        res = requests.get(url, params=params, headers=get_headers(), timeout=10)
+        headers = get_headers()
+        params = {"parent_id": parent_id, "limit": 100, "pan_auth": headers.get('pan-auth'), "space": XUNLEI_SPACE}
+        res = requests.get(url, params=params, headers=headers, timeout=10)
         if res.status_code == 200:
-            data = res.json()
-            for item in data.get('files', []):
+            for item in res.json().get('files', []):
                 if item.get('kind') == 'drive#folder' and not item.get('trashed'):
                     folders.append({'name': item.get('name'), 'id': item.get('id')})
-    except Exception as e:
-        print(f"获取文件夹失败: {e}")
+    except: pass
     return folders
 
+# ===========================
+# 3. Telegram 交互
+# ===========================
 
-@bot.message_handler(func=lambda message: True)
-def handle_message(message):
-    if str(message.chat.id) != CHAT_ID:
-        return
-    
-    text = message.text.strip()
-    all_parts = text.split()
-    magnets = [p for p in all_parts if p.startswith("magnet:?") or p.endswith(".torrent")]
-    
-    if magnets:
-        user_pending_tasks[message.chat.id] = magnets
-        count = len(magnets)
-        
-        sub_folders = get_sub_folders(PARENT_FILE_ID)
-        
-        markup = InlineKeyboardMarkup()
-        markup.row_width = 2
-        
-        if sub_folders:
-            buttons = [InlineKeyboardButton(f['name'], callback_data=f"dl|{f['id']}|{f['name'][:10]}") for f in sub_folders]
-            markup.add(*buttons)
-        else:
-            markup.add(InlineKeyboardButton("直接下载", callback_data=f"dl|{PARENT_FILE_ID}|root"))
-        
-        markup.add(InlineKeyboardButton("❌ 取消", callback_data="cancel"))
-        bot.reply_to(message, f"⚡️ 识别到 {count} 个磁力链接\n请选择下载位置：", reply_markup=markup)
+@bot.message_handler(commands=['token', 'start'])
+def handle_token_cmd(message):
+    if str(message.chat.id) != CHAT_ID: return
+    is_alive = check_token_alive(verbose=True)
+    status = "✅ 有效" if is_alive else "❌ 失效"
+    msg = f"🔧 **状态面板**\n迅雷状态: {status}\nHost: `{XUNLEI_HOST}`"
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🔄 刷新Token", callback_data="sys_refresh_token"))
+    markup.add(InlineKeyboardButton("🩺 检查连接", callback_data="sys_check_health"))
+    bot.reply_to(message, msg, parse_mode="Markdown", reply_markup=markup)
+
+@bot.message_handler(commands=['check'])
+def handle_check(message):
+    if str(message.chat.id) != CHAT_ID: return
+    if check_token_alive(verbose=True):
+        bot.reply_to(message, "✅ Token 正常")
     else:
-        bot.reply_to(message, "请发送磁力链接")
-
+        bot.reply_to(message, "❌ Token 失效，正在修复...")
+        perform_sniffing(message.chat.id)
 
 @bot.callback_query_handler(func=lambda call: True)
-def callback_query(call):
-    chat_id = call.message.chat.id
+def callback_handler(call):
+    chat_id = str(call.message.chat.id)
     data = call.data
-    
+
+    if data == "sys_refresh_token":
+        bot.answer_callback_query(call.id, "开始嗅探...")
+        perform_sniffing(chat_id)
+        return
+    if data == "sys_check_health":
+        alive = check_token_alive(verbose=True)
+        bot.answer_callback_query(call.id, "Token 有效" if alive else "Token 失效")
+        return
     if data == "cancel":
         bot.answer_callback_query(call.id, "已取消")
-        bot.delete_message(chat_id, call.message.message_id)
-        if chat_id in user_pending_tasks:
-            del user_pending_tasks[chat_id]
+        try: bot.delete_message(chat_id, call.message.message_id)
+        except: pass
+        if int(chat_id) in user_pending_tasks: del user_pending_tasks[int(chat_id)]
         return
 
     if data.startswith("dl|"):
-        try:
-            _, target_id, target_name = data.split("|", 2)
-        except ValueError:
-            return
+        try: _, target_id, target_name = data.split("|", 2)
+        except: return
 
-        magnets = user_pending_tasks.get(chat_id)
+        magnets = user_pending_tasks.get(int(chat_id))
         if not magnets:
-            bot.answer_callback_query(call.id, "任务过期")
+            bot.answer_callback_query(call.id, "任务已过期")
             return
+            
+        bot.answer_callback_query(call.id, "处理中...")
+        status_msg = bot.edit_message_text(f"⏳ 正在添加 {len(magnets)} 个任务...", chat_id, call.message.message_id)
         
-        bot.answer_callback_query(call.id, f"处理中...")
-        bot.edit_message_text(f"⏳ 处理 {len(magnets)} 个任务...", chat_id, call.message.message_id)
-        
-        success_list = []
+        success_files = []
         fail_count = 0
         
-        for i, magnet in enumerate(magnets, 1):
-            print(f"\n{'#'*70}")
-            print(f"# 任务 {i}/{len(magnets)}")
-            print(f"{'#'*70}")
-            
-            result_name = create_task(magnet, target_id, target_name)
-            
-            if result_name:
-                success_list.append(result_name)
+        for m in magnets:
+            file_names = create_task(m, target_id, target_name)
+            if file_names:
+                success_files.extend(file_names)
             else:
                 fail_count += 1
+            time.sleep(1)
+
+        safe_dir = target_name.replace("`", "")
+        report = f"📂 **目录**: `{safe_dir}`\n"
+        
+        if success_files:
+            report += f"✅ **成功添加 {len(success_files)} 个文件**:\n"
+            for name in success_files[:15]:
+                safe_name = name.replace("`", "")
+                report += f"• `{safe_name}`\n"
+            if len(success_files) > 15:
+                report += f"...以及其他 {len(success_files)-15} 个文件"
+        else:
+            report += "❌ **所有任务添加失败**"
             
-            if i < len(magnets):
-                time.sleep(10)
-
-        report = f"✅ 完成\n📂 {target_name}\n📊 成功:{len(success_list)} 失败:{fail_count}\n"
-        if success_list:
-            for name in success_list[:5]:
-                report += f"🔹 {name}\n"
+        if fail_count > 0:
+            report += f"\n⚠️ 有 {fail_count} 个磁力链接解析失败"
         
-        bot.edit_message_text(report, chat_id, call.message.message_id)
-        
-        if chat_id in user_pending_tasks:
-            del user_pending_tasks[chat_id]
+        bot.edit_message_text(report, chat_id, status_msg.message_id, parse_mode="Markdown")
+        if int(chat_id) in user_pending_tasks: del user_pending_tasks[int(chat_id)]
 
+@bot.message_handler(func=lambda message: True)
+def handle_msg(message):
+    if str(message.chat.id) != CHAT_ID: return
+    text = message.text.strip()
+    magnets = [w for w in text.split() if "magnet:?" in w or w.endswith(".torrent")]
+    
+    if magnets:
+        user_pending_tasks[message.chat.id] = magnets
+        markup = InlineKeyboardMarkup()
+        folders = get_sub_folders(XUNLEI_PARENT_FILE_ID)
+        for f in folders:
+            markup.add(InlineKeyboardButton(f"📂 {f['name']}", callback_data=f"dl|{f['id']}|{f['name']}"))
+        markup.add(InlineKeyboardButton("⬇️ 默认目录", callback_data=f"dl|{XUNLEI_PARENT_FILE_ID or 'root'}|默认目录"))
+        markup.add(InlineKeyboardButton("❌ 取消", callback_data="cancel"))
+        bot.reply_to(message, f"⚡️ 发现 {len(magnets)} 个任务，请选择位置：", reply_markup=markup)
 
 if __name__ == "__main__":
     print("🤖 Bot 启动...")
-    print(f"   HOST: {XUNLEI_HOST}")
-    
+    t = threading.Thread(target=health_check_loop, daemon=True)
+    t.start()
     while True:
-        try:
-            # 增加 timeout 设置，让连接更持久
-            # long_polling_timeout: 告诉 TG 服务器我们要挂多久
-            # timeout: 本地客户端等待多久
-            bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        try: bot.infinity_polling(timeout=60, long_polling_timeout=60)
         except Exception as e:
-            print(f"❌ 网络连接中断 ({e})，15秒后重试...")
             time.sleep(15)
+            logging.error(f"Polling error: {e}")

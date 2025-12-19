@@ -2,35 +2,39 @@ services:
   xunlei-bot:
     image: ch1swill/xunlei-tg-bot:latest
     container_name: xunlei_tg_bot
+    # 【关键】给予特权，否则 tcpdump 没权限抓包
+    privileged: true
+    # 为了自动获取TOKEN 建议将XUNLEI和此DOCKER放在同一个主机上，且都使用HOST模式
+    network_mode: host
     environment:
       # ========== Telegram 配置 ==========
-      - BOT_TOKEN=你的TG_BOT_TOKEN
-      - CHAT_ID=你的TG_CHAT_ID
+      - BOT_TOKEN=YOUR_BOT_TOKEN
+      - CHAT_ID=YOUR_CHATID
       
       # ========== 迅雷配置 ==========
-      # 迅雷 API 地址 (群晖套件格式)
-      - XUNLEI_HOST=http://你的NAS_IP:2345/webman/3rdparty/pan-xunlei-com/index.cgi
+      # 迅雷地址
+      - XUNLEI_HOST=http://迅雷IP:端口/webman/3rdparty/pan-xunlei-com/index.cgi
       
-      # 默认下载目录的 file_id (从迅雷网页版获取)
-      - XUNLEI_PARENT_FILE_ID=你的目录ID
+      # 默认下载根目录的 file_id (从迅雷网页版获取 往迅雷随便下一个文件F12查看)
+      - XUNLEI_PARENT_FILE_ID=
       
       # 设备空间 ID (URL编码格式)
-      - XUNLEI_SPACE=device_id%23你的设备ID
+      - XUNLEI_SPACE=device_id%XXXXXXXXXXXXXXXXXXXXXX
       
-      # 【修改】这里不要写死 Token 了，或者留空作为备用
+      # 认证 Token (可以不填)
       - XUNLEI_AUTH=
       
-      # 【新增】告诉程序数据库在哪里
-      - XUNLEI_DB_PATH=/xunlei_data/user.core.db
+      # 嗅探配置 (迅雷端口)
+      - SNIFF_PORT=2345
+      # 如果 Bridge 模式下无法抓到包，尝试改为 eth0
+      - SNIFF_INTERFACE=any 
       
-      # ========== 代理配置 (可选) ==========
-      - HTTPS_PROXY=http://代理IP:端口
-      - HTTP_PROXY=http://代理IP:端口
-      - NO_PROXY=localhost,127.0.0.1,你的NAS_IP
-    volumes:
-      # 【新增关键行】将迅雷的配置目录映射进来 (只读模式 :ro 防止损坏)
-      # ⚠️ 注意：冒号左边的路径必须是你 NAS 上 cnk3x 容器实际的映射路径
-      # 通常是 /mnt/sdb1/configs/xunlei/data 包含 user.core.db 的目录
-      - /mnt/nas_docker/xunlei/.drive:/xunlei_data:ro  
-      
+      # 健康检查：(默认3600秒=1小时)
+      - HEALTH_CHECK_INTERVAL=28800
+
+      # ========== 代理配置 (国内环境可选) ==========
+      - HTTPS_PROXY=http://192.168.2.1:7890
+      - HTTP_PROXY=http://192.168.2.1:7890
+      - NO_PROXY=localhost,127.0.0.1,或本机IP
+
     restart: unless-stopped
