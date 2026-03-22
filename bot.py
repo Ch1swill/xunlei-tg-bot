@@ -58,17 +58,22 @@ def update_token(new_token):
 
 def try_get_token_from_memory():
     """从 xlp 进程内存提取 UIAuth token，无需用户操作。成功返回 token 字符串，失败返回空字符串。"""
-    import re, base64, json, subprocess
+    import re, base64, json
     try:
-        result = subprocess.run(
-            ['pgrep', '-f', r'xlp.*--chroot'],
-            capture_output=True, text=True, timeout=5
-        )
-        pids = [p for p in result.stdout.strip().split() if p]
-        if not pids:
+        pid = None
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f'/proc/{entry}/cmdline', 'rb') as f:
+                    cmdline = f.read().replace(b'\x00', b' ').decode('utf-8', errors='ignore')
+                if 'xlp' in cmdline and '--chroot' in cmdline:
+                    pid = entry
+            except Exception:
+                pass
+        if not pid:
             logging.warning("内存提取：未找到 xlp 进程")
             return ""
-        pid = pids[-1]
 
         with open(f'/proc/{pid}/maps') as f:
             maps = f.read()
