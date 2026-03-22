@@ -6,7 +6,6 @@ services:
     privileged: true
     # 为了自动获取TOKEN 建议将XUNLEI和此DOCKER放在同一个主机上，且都使用HOST模式
     network_mode: host
-    pid: host
     environment:
       # ========== Telegram 配置 ==========
       - BOT_TOKEN=YOUR_BOT_TOKEN

@@ -56,66 +56,28 @@ def update_token(new_token):
         CURRENT_TOKEN = new_token
     logging.info(f"🔄 Token 已更新: {new_token[:10]}...")
 
-def try_get_token_from_memory():
-    """从 xlp 进程内存提取 UIAuth token，无需用户操作。成功返回 token 字符串，失败返回空字符串。"""
+def try_get_token_from_web():
+    """从迅雷 Web UI 主页提取 UIAuth token。xlp 会将 token 嵌入页面 HTML，有效期约 72 小时。"""
     import re, base64, json
     try:
-        pid = None
-        for entry in os.listdir('/proc'):
-            if not entry.isdigit():
-                continue
-            try:
-                with open(f'/proc/{entry}/cmdline', 'rb') as f:
-                    cmdline = f.read().replace(b'\x00', b' ').decode('utf-8', errors='ignore')
-                if 'xlp' in cmdline and '--chroot' in cmdline:
-                    pid = entry
-            except Exception:
-                pass
-        if not pid:
-            logging.warning("内存提取：未找到 xlp 进程")
+        url = XUNLEI_HOST.rstrip('/') + '/'
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            logging.warning(f"Web UI 请求失败: {resp.status_code}")
             return ""
-
-        with open(f'/proc/{pid}/maps') as f:
-            maps = f.read()
-
-        regions = []
-        for line in maps.split('\n'):
-            parts = line.split()
-            if len(parts) >= 2 and 'rw' in parts[1] and 'xunlei' not in line:
-                addr = parts[0].split('-')
-                start, end = int(addr[0], 16), int(addr[1], 16)
-                if 0 < (end - start) < 50 * 1024 * 1024:
-                    regions.append((start, end))
-
-        best_tok, best_exp = "", 0
-        now = int(time.time())
-        with open(f'/proc/{pid}/mem', 'rb') as mem:
-            for start, end in regions[:20]:
-                try:
-                    mem.seek(start)
-                    data = mem.read(end - start)
-                    for t in re.findall(rb'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+', data):
-                        ts = t.decode('utf-8', errors='ignore')
-                        if len(ts) < 50:
-                            continue
-                        try:
-                            p = ts.split('.')
-                            pad = len(p[1]) % 4
-                            pl = json.loads(base64.b64decode(p[1] + '=' * pad))
-                            if pl.get('key') == 'UIAuth' and pl.get('exp', 0) > now + 60:
-                                if pl['exp'] > best_exp:
-                                    best_exp, best_tok = pl['exp'], ts
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-        if best_tok:
-            ttl = best_exp - now
-            logging.info(f"内存提取 Token 成功，剩余 {ttl//3600}h {(ttl%3600)//60}m")
-        return best_tok
+        m = re.search(r'function uiauth\(.*?\)\s*\{\s*return\s+"(eyJ[^"]+)"', resp.text)
+        if not m:
+            logging.warning("Web UI 响应中未找到 uiauth token")
+            return ""
+        token = m.group(1)
+        p = token.split('.')
+        pad = len(p[1]) % 4
+        pl = json.loads(base64.b64decode(p[1] + '=' * pad))
+        ttl = (pl.get('exp', 0) - int(time.time())) // 3600
+        logging.info(f"Web UI 提取 Token 成功，剩余 {ttl}h")
+        return token
     except Exception as e:
-        logging.warning(f"内存提取 Token 失败: {e}")
+        logging.warning(f"Web UI 提取 Token 失败: {e}")
         return ""
 
 def perform_sniffing(chat_id, quiet=False):
@@ -132,7 +94,7 @@ def perform_sniffing(chat_id, quiet=False):
         global IS_SNIFFING
         try:
             # 优先：从进程内存提取（无需用户操作）
-            token = try_get_token_from_memory()
+            token = try_get_token_from_web()
             if token:
                 update_token(token)
                 bot.send_message(chat_id, "✅ Token 已自动从内存获取", parse_mode="Markdown")
@@ -178,7 +140,7 @@ def health_check_loop():
             logging.info("🩺 执行例行健康检查...")
             if not check_token_alive(verbose=True):
                 logging.warning("⚠️ 检测到 Token 失效，尝试内存自动提取...")
-                token = try_get_token_from_memory()
+                token = try_get_token_from_web()
                 if token:
                     update_token(token)
                     logging.info("✅ Token 已从内存静默更新")
