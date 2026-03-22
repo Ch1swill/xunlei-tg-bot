@@ -56,6 +56,63 @@ def update_token(new_token):
         CURRENT_TOKEN = new_token
     logging.info(f"🔄 Token 已更新: {new_token[:10]}...")
 
+def try_get_token_from_memory():
+    """从 xlp 进程内存提取 UIAuth token，无需用户操作。成功返回 token 字符串，失败返回空字符串。"""
+    import re, base64, json, subprocess
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', r'xlp.*--chroot'],
+            capture_output=True, text=True, timeout=5
+        )
+        pids = [p for p in result.stdout.strip().split() if p]
+        if not pids:
+            logging.warning("内存提取：未找到 xlp 进程")
+            return ""
+        pid = pids[-1]
+
+        with open(f'/proc/{pid}/maps') as f:
+            maps = f.read()
+
+        regions = []
+        for line in maps.split('\n'):
+            parts = line.split()
+            if len(parts) >= 2 and 'rw' in parts[1] and 'xunlei' not in line:
+                addr = parts[0].split('-')
+                start, end = int(addr[0], 16), int(addr[1], 16)
+                if 0 < (end - start) < 50 * 1024 * 1024:
+                    regions.append((start, end))
+
+        best_tok, best_exp = "", 0
+        now = int(time.time())
+        with open(f'/proc/{pid}/mem', 'rb') as mem:
+            for start, end in regions[:20]:
+                try:
+                    mem.seek(start)
+                    data = mem.read(end - start)
+                    for t in re.findall(rb'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+', data):
+                        ts = t.decode('utf-8', errors='ignore')
+                        if len(ts) < 50:
+                            continue
+                        try:
+                            p = ts.split('.')
+                            pad = len(p[1]) % 4
+                            pl = json.loads(base64.b64decode(p[1] + '=' * pad))
+                            if pl.get('key') == 'UIAuth' and pl.get('exp', 0) > now + 60:
+                                if pl['exp'] > best_exp:
+                                    best_exp, best_tok = pl['exp'], ts
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+        if best_tok:
+            ttl = best_exp - now
+            logging.info(f"内存提取 Token 成功，剩余 {ttl//3600}h {(ttl%3600)//60}m")
+        return best_tok
+    except Exception as e:
+        logging.warning(f"内存提取 Token 失败: {e}")
+        return ""
+
 def perform_sniffing(chat_id, quiet=False):
     global IS_SNIFFING
     if IS_SNIFFING:
@@ -69,6 +126,15 @@ def perform_sniffing(chat_id, quiet=False):
     def run_sniff_thread():
         global IS_SNIFFING
         try:
+            # 优先：从进程内存提取（无需用户操作）
+            token = try_get_token_from_memory()
+            if token:
+                update_token(token)
+                bot.send_message(chat_id, "✅ Token 已自动从内存获取", parse_mode="Markdown")
+                return
+            # 兜底：tcpdump 嗅探（需要用户刷新迅雷页面）
+            if not quiet:
+                bot.send_message(chat_id, "💡 自动提取失败，请在迅雷Web界面刷新页面触发抓包...")
             token = sniff.capture_token(timeout=60, port=SNIFF_PORT, interface=SNIFF_INTERFACE)
             if token:
                 update_token(token)
@@ -106,8 +172,14 @@ def health_check_loop():
             # 1. 先执行检查
             logging.info("🩺 执行例行健康检查...")
             if not check_token_alive(verbose=True):
-                logging.warning("⚠️ 检测到 Token 失效，自动启动嗅探...")
-                perform_sniffing(CHAT_ID, quiet=False)
+                logging.warning("⚠️ 检测到 Token 失效，尝试内存自动提取...")
+                token = try_get_token_from_memory()
+                if token:
+                    update_token(token)
+                    logging.info("✅ Token 已从内存静默更新")
+                else:
+                    logging.warning("内存提取失败，通知用户手动操作")
+                    bot.send_message(CHAT_ID, "⚠️ Token 已失效且无法自动获取，请打开迅雷网页后发送 /check")
             else:
                 logging.info("✅ Token 状态正常")
                 

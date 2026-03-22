@@ -1,0 +1,9 @@
+CLAUDE.md
+__pycache__/
+*.pyc
+*.pyo
+.git
+.gitignore
+.dockerignore
+docker-compose.yaml
+README.md
